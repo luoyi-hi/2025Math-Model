@@ -1,35 +1,49 @@
-"""Feature extraction pipeline for the bearing transfer learning task.
+"""Comprehensive feature-extraction pipeline for the bearing transfer-learning task.
 
-This script prepares a curated source-domain dataset using the provided CWRU
-bearing data. It performs the following steps:
+This script processes every MATLAB record inside the provided source and target
+vibration datasets.  It consolidates metadata, optionally resamples each signal
+so that all records share a common sampling rate, extracts rich diagnostic
+features, and exports analysis-ready tables for downstream modelling.
 
-1. Collect the 12 kHz drive-end fault signals (rolling element, inner race and
-   centered outer race faults) and the normal-condition baselines.
-2. Optionally resample signals to a common rate and clip them to a fixed
-   duration to match the target-domain recording setup.
-3. Compute a rich set of time-domain, frequency-domain and envelope features for
-   each signal to characterise the bearing health state.
-4. Write the per-record features and aggregated summaries to CSV files, which
-   can be used in downstream transfer-learning experiments.
+Key capabilities
+----------------
+* Traverse the full directory tree under ``数据集/源域数据集`` (12 kHz/48 kHz
+  drive-end, fan-end and normal conditions) and ``数据集/目标域数据集`` (32 kHz
+  train-borne measurements).
+* Infer fault type, severity, load condition and orientation directly from file
+  names while gracefully handling unlabeled target-domain records.
+* Compute comprehensive time, frequency and envelope indicators for every
+  record, providing a consistent feature representation for transfer-learning
+  experiments.
+* Emit metadata catalogues, per-record feature tables, aggregated statistics and
+  dataset summaries to facilitate exploratory analysis and model development.
 
-Usage
------
+Example
+-------
+The following command processes both source and target datasets, resamples all
+signals to 12 kHz, clips/pads them to 8 seconds and writes the resulting
+artifacts to ``artifacts/full_features``::
 
-```bash
-python -m src.feature_extraction \
-    --source-root 数据集/源域数据集 \
-    --output-dir artifacts/source_features \
-    --sensor DE \
-    --target-sample-rate 12000 \
-    --clip-seconds 8
-```
+    python -m src.feature_extraction \
+        --source-root 数据集/源域数据集 \
+        --target-root 数据集/目标域数据集 \
+        --output-dir artifacts/full_features \
+        --target-sample-rate 12000 \
+        --clip-seconds 8
 
-The output directory will contain three files:
-```
-- features.csv:       per-record feature table
-- feature_means.csv:  class-wise mean feature values
-- dataset_summary.json: metadata about the curated dataset
-```
+Outputs
+-------
+``record_catalog.csv``
+    Metadata describing each processed file (domain, dataset, sensor, label,
+    etc.).
+``features.csv``
+    Per-record diagnostic features that can be fed into machine-learning
+    pipelines.
+``feature_means.csv``
+    Aggregated feature means grouped by domain, dataset, sensor and fault type.
+``dataset_summary.json``
+    High-level overview of the curated dataset (record counts, label
+    distribution, sampling rates, durations, etc.).
 """
 from __future__ import annotations
 
@@ -48,75 +62,198 @@ from scipy.signal import hilbert, resample
 from scipy.stats import entropy, kurtosis, skew
 
 
+_ORIENTATIONS = {"Centered", "Opposite", "Orthogonal"}
+
+
 @dataclass
 class BearingRecord:
-    """Container for metadata describing a single vibration record."""
+    """Container describing a single vibration record to be processed."""
 
     path: Path
-    sensor: str
+    domain: str
+    dataset: str
+    sensor: Optional[str]
     fault_type: str
     fault_size: Optional[float]
     load: Optional[int]
     orientation: Optional[str]
-    rpm: Optional[float]
     sample_rate: float
 
-    def to_dict(self) -> Dict[str, Optional[float]]:
+    def to_dict(self) -> Dict[str, object]:
         data = asdict(self)
         data["path"] = str(self.path)
+        data["sensor"] = data["sensor"] if data["sensor"] is not None else "Unknown"
+        data["orientation"] = data["orientation"] if data["orientation"] is not None else ""
         return data
 
 
-def _parse_fault_metadata(path: Path, sensor: str) -> Tuple[str, Optional[float], Optional[int], Optional[str]]:
-    """Infer fault attributes from the file path."""
+def _parse_source_top_dir(component: str) -> Tuple[float, Optional[str]]:
+    """Infer the sampling rate and sensor family from a directory name."""
+
+    match = re.match(r"(?P<rate>\d+)kHz_(?P<label>.+)_data$", component)
+    if not match:
+        raise ValueError(f"Unrecognised source dataset directory: {component}")
+
+    sample_rate = float(match.group("rate")) * 1000.0
+    label = match.group("label").upper()
+
+    if label in {"DE", "FE", "BA"}:
+        sensor = label
+    elif label == "NORMAL":
+        sensor = "DE"
+    else:
+        sensor = None
+
+    return sample_rate, sensor
+
+
+def _parse_fault_metadata(path: Path) -> Tuple[str, Optional[float], Optional[int], Optional[str]]:
+    """Infer fault attributes from the file name and directory structure."""
 
     stem = path.stem
-    parts = path.parts
     orientation = None
-
-    if "OR" in parts:
-        # Orientation stored two levels above file (Centered/Opposite/Orthogonal).
-        try:
-            idx = parts.index("OR")
-            orientation = parts[idx + 1]
-        except ValueError:
-            orientation = None
+    for part in path.parts:
+        if part in _ORIENTATIONS:
+            orientation = part
+            break
 
     load_match = re.search(r"_(\d)(?:_|$)", stem)
     load = int(load_match.group(1)) if load_match else None
 
-    if stem.startswith("B"):
+    if stem.startswith("B") and len(stem) >= 4:
         fault_type = "B"
         severity = float(stem[1:4]) / 1000.0
-    elif stem.startswith("IR"):
+    elif stem.startswith("IR") and len(stem) >= 5:
         fault_type = "IR"
         severity = float(stem[2:5]) / 1000.0
-    elif stem.startswith("OR"):
+    elif stem.startswith("OR") and len(stem) >= 5:
         fault_type = "OR"
         severity = float(stem[2:5]) / 1000.0
         if orientation is None:
-            # Fallback for safety.
             orientation = "Unknown"
     elif stem.startswith("N"):
         fault_type = "N"
         severity = None
         if load is None:
-            load_fragments = re.findall(r"_(\d)", stem)
-            load = int(load_fragments[0]) if load_fragments else None
+            load_digits = re.findall(r"_(\d)", stem)
+            load = int(load_digits[0]) if load_digits else None
     else:
         raise ValueError(f"Unrecognised file naming scheme for {path}")
 
     return fault_type, severity, load, orientation
 
 
-def _extract_signal(mat: Dict[str, np.ndarray], sensor: str) -> np.ndarray:
-    """Fetch the vibration signal for the requested sensor."""
+def collect_source_records(
+    root: Path,
+    *,
+    include_datasets: Optional[Sequence[str]] = None,
+    include_sensors: Optional[Sequence[str]] = None,
+) -> List[BearingRecord]:
+    """Scan the source-domain tree and build a catalogue of records."""
 
-    suffix = f"_{sensor}_time"
-    for key, value in mat.items():
-        if key.endswith(suffix):
-            return np.asarray(value).squeeze()
-    raise KeyError(f"No {sensor} channel found in keys: {list(mat)}")
+    if not root.exists():
+        raise FileNotFoundError(f"Source dataset directory not found: {root}")
+
+    dataset_filter = set(include_datasets) if include_datasets else None
+    sensor_filter = {s.upper() for s in include_sensors} if include_sensors else None
+
+    records: List[BearingRecord] = []
+    for mat_path in sorted(root.rglob("*.mat")):
+        relative = mat_path.relative_to(root)
+        top_component = relative.parts[0]
+        if dataset_filter and top_component not in dataset_filter:
+            continue
+
+        sample_rate, sensor = _parse_source_top_dir(top_component)
+        if sensor_filter and (sensor is None or sensor not in sensor_filter):
+            continue
+
+        fault_type, severity, load, orientation = _parse_fault_metadata(mat_path)
+
+        records.append(
+            BearingRecord(
+                path=mat_path,
+                domain="source",
+                dataset=top_component,
+                sensor=sensor,
+                fault_type=fault_type,
+                fault_size=severity,
+                load=load,
+                orientation=orientation,
+                sample_rate=sample_rate,
+            )
+        )
+
+    return records
+
+
+def collect_target_records(root: Path, *, sample_rate: float = 32000.0) -> List[BearingRecord]:
+    """Create records for every target-domain measurement."""
+
+    if not root.exists():
+        raise FileNotFoundError(f"Target dataset directory not found: {root}")
+
+    records: List[BearingRecord] = []
+    for mat_path in sorted(root.rglob("*.mat")):
+        records.append(
+            BearingRecord(
+                path=mat_path,
+                domain="target",
+                dataset=root.name,
+                sensor=None,
+                fault_type="Unknown",
+                fault_size=None,
+                load=None,
+                orientation=None,
+                sample_rate=sample_rate,
+            )
+        )
+
+    return records
+
+
+def _extract_signal(
+    mat: Dict[str, np.ndarray],
+    *,
+    record: BearingRecord,
+) -> Tuple[np.ndarray, str]:
+    """Fetch the vibration signal array and the key it originated from."""
+
+    def _is_valid_key(key: str) -> bool:
+        if key.startswith("__"):
+            return False
+        if key.lower().endswith("rpm"):
+            return False
+        return True
+
+    def _load_if_valid(key: str) -> Optional[np.ndarray]:
+        if not _is_valid_key(key):
+            return None
+        array = np.asarray(mat[key]).squeeze()
+        if array.ndim != 1 or array.size <= 1:
+            return None
+        return array
+
+    if record.sensor:
+        suffix = f"_{record.sensor}_time"
+        for key in mat:
+            if key.endswith(suffix):
+                array = _load_if_valid(key)
+                if array is not None:
+                    return array, key
+
+    stem = record.path.stem
+    if stem in mat:
+        array = _load_if_valid(stem)
+        if array is not None:
+            return array, stem
+
+    for key in mat:
+        array = _load_if_valid(key)
+        if array is not None:
+            return array, key
+
+    raise KeyError(f"No usable signal channel found in {record.path}")
 
 
 def _extract_rpm(mat: Dict[str, np.ndarray]) -> Optional[float]:
@@ -129,84 +266,6 @@ def _extract_rpm(mat: Dict[str, np.ndarray]) -> Optional[float]:
     return None
 
 
-def collect_drive_end_records(root: Path, *, orientation: str = "Centered") -> List[BearingRecord]:
-    """Collect 12 kHz drive-end fault records plus baseline normal samples."""
-
-    records: List[BearingRecord] = []
-    sensor = "DE"
-    base_dir = root / "12kHz_DE_data"
-    sample_rate = 12000.0
-
-    if not base_dir.exists():
-        raise FileNotFoundError(f"Expected directory missing: {base_dir}")
-
-    # Rolling element and inner race faults.
-    for fault_group in ["B", "IR"]:
-        fault_dir = base_dir / fault_group
-        for severity_dir in sorted(fault_dir.iterdir()):
-            if not severity_dir.is_dir():
-                continue
-            for mat_path in sorted(severity_dir.glob("*.mat")):
-                fault_type, severity, load, _ = _parse_fault_metadata(mat_path, sensor)
-                records.append(
-                    BearingRecord(
-                        path=mat_path,
-                        sensor=sensor,
-                        fault_type=fault_type,
-                        fault_size=severity,
-                        load=load,
-                        orientation=None,
-                        rpm=None,
-                        sample_rate=sample_rate,
-                    )
-                )
-
-    # Outer race faults - use specified orientation for consistency.
-    or_dir = base_dir / "OR" / orientation
-    if not or_dir.exists():
-        raise FileNotFoundError(f"Expected outer-race orientation directory missing: {or_dir}")
-
-    for severity_dir in sorted(or_dir.iterdir()):
-        if not severity_dir.is_dir():
-            continue
-        for mat_path in sorted(severity_dir.glob("*.mat")):
-            fault_type, severity, load, orient = _parse_fault_metadata(mat_path, sensor)
-            records.append(
-                BearingRecord(
-                    path=mat_path,
-                    sensor=sensor,
-                    fault_type=fault_type,
-                    fault_size=severity,
-                    load=load,
-                    orientation=orient,
-                    rpm=None,
-                    sample_rate=sample_rate,
-                )
-            )
-
-    # Normal baselines (48 kHz) - resample later to align with 12 kHz faults.
-    normal_dir = root / "48kHz_Normal_data"
-    if normal_dir.exists():
-        for mat_path in sorted(normal_dir.glob("*.mat")):
-            fault_type, severity, load, orientation = _parse_fault_metadata(mat_path, sensor)
-            records.append(
-                BearingRecord(
-                    path=mat_path,
-                    sensor=sensor,
-                    fault_type=fault_type,
-                    fault_size=severity,
-                    load=load,
-                    orientation=orientation,
-                    rpm=None,
-                    sample_rate=48000.0,
-                )
-            )
-    else:
-        raise FileNotFoundError(f"Normal-condition directory missing: {normal_dir}")
-
-    return records
-
-
 def _prepare_signal(
     signal: np.ndarray,
     *,
@@ -214,22 +273,21 @@ def _prepare_signal(
     target_rate: Optional[float],
     clip_seconds: Optional[float],
 ) -> Tuple[np.ndarray, float]:
-    """Resample and clip the vibration signal."""
+    """Resample and optionally clip/pad a signal."""
 
     if signal.ndim != 1:
         signal = signal.reshape(-1)
 
     effective_rate = original_rate
-    if target_rate is not None and not math.isclose(original_rate, target_rate):
-        # Resample to target rate.
+    if target_rate is not None and target_rate > 0 and not math.isclose(original_rate, target_rate):
         target_length = int(round(len(signal) * target_rate / original_rate))
+        target_length = max(target_length, 1)
         signal = resample(signal, target_length)
         effective_rate = target_rate
 
     if clip_seconds is not None and clip_seconds > 0:
         target_length = int(round(effective_rate * clip_seconds))
-        if target_length <= 0:
-            raise ValueError("clip_seconds resulted in non-positive target length")
+        target_length = max(target_length, 1)
         if len(signal) >= target_length:
             signal = signal[:target_length]
         else:
@@ -240,7 +298,6 @@ def _prepare_signal(
 
 
 def _time_features(signal: np.ndarray) -> Dict[str, float]:
-    features: Dict[str, float] = {}
     if signal.size == 0:
         raise ValueError("Empty signal encountered during feature computation")
 
@@ -260,33 +317,30 @@ def _time_features(signal: np.ndarray) -> Dict[str, float]:
     kurtosis_factor = float(np.mean(signal ** 4) / (square_mean ** 2)) if square_mean > 0 else 0.0
     skewness = float(skew(signal))
     kurt_val = float(kurtosis(signal, fisher=True))
-    entropy_val = float(entropy(np.histogram(signal, bins=64, density=True)[0] + 1e-12))
+    histogram = np.histogram(signal, bins=64, density=True)[0] + 1e-12
+    entropy_val = float(entropy(histogram))
     zero_crossings = float(np.sum(signal[:-1] * signal[1:] < 0))
-    zcr = zero_crossings / (signal.size - 1)
+    zcr = zero_crossings / max(signal.size - 1, 1)
 
-    features.update(
-        {
-            "mean": mean_val,
-            "std": std_val,
-            "rms": rms_val,
-            "variance": float(np.var(signal)),
-            "abs_mean": abs_mean,
-            "peak": peak_val,
-            "peak_to_peak": peak_to_peak,
-            "crest_factor": crest_factor,
-            "impulse_factor": impulse_factor,
-            "clearance_factor": clearance_factor,
-            "shape_factor": shape_factor,
-            "kurtosis_factor": kurtosis_factor,
-            "skewness": skewness,
-            "kurtosis": kurt_val,
-            "entropy": entropy_val,
-            "zero_crossing_rate": zcr,
-            "signal_energy": float(np.sum(signal ** 2)),
-        }
-    )
-
-    return features
+    return {
+        "mean": mean_val,
+        "std": std_val,
+        "rms": rms_val,
+        "variance": float(np.var(signal)),
+        "abs_mean": abs_mean,
+        "peak": peak_val,
+        "peak_to_peak": peak_to_peak,
+        "crest_factor": crest_factor,
+        "impulse_factor": impulse_factor,
+        "clearance_factor": clearance_factor,
+        "shape_factor": shape_factor,
+        "kurtosis_factor": kurtosis_factor,
+        "skewness": skewness,
+        "kurtosis": kurt_val,
+        "entropy": entropy_val,
+        "zero_crossing_rate": zcr,
+        "signal_energy": float(np.sum(signal ** 2)),
+    }
 
 
 def _frequency_features(
@@ -325,7 +379,6 @@ def _frequency_features(
         "spectral_bandwidth": bandwidth,
     }
 
-    # Band-specific energy ratios.
     band_edges = sorted(band_edges)
     for low, high in zip(band_edges[:-1], band_edges[1:]):
         if high <= low:
@@ -335,7 +388,6 @@ def _frequency_features(
         label = f"band_energy_{int(low)}_{int(high)}"
         features[label] = band_power / total_power
 
-    # Cumulative energy up to characteristic harmonics (1x and 2x shaft speed).
     shaft_freq = None if rpm is None or np.isnan(rpm) else rpm / 60.0
     if shaft_freq is not None and shaft_freq > 0:
         for multiple in [1, 2, 3]:
@@ -343,10 +395,14 @@ def _frequency_features(
             mask = freqs <= upper
             features[f"cum_energy_upto_{multiple}x"] = float(np.sum(power[mask]) / total_power)
 
-    # Spectral skewness and kurtosis using power distribution.
     norm_power = power / total_power
-    features["spectral_skewness"] = float(np.sum(((freqs - centroid) ** 3) * norm_power) / (spread ** 3 + 1e-12))
-    features["spectral_kurtosis"] = float(np.sum(((freqs - centroid) ** 4) * norm_power) / (spread ** 4 + 1e-12))
+    spread_safe = spread if spread > 1e-12 else 1e-12
+    features["spectral_skewness"] = float(
+        np.sum(((freqs - centroid) ** 3) * norm_power) / (spread_safe ** 3)
+    )
+    features["spectral_kurtosis"] = float(
+        np.sum(((freqs - centroid) ** 4) * norm_power) / (spread_safe ** 4)
+    )
 
     return features
 
@@ -383,7 +439,7 @@ def extract_features_for_record(
     clip_seconds: Optional[float] = None,
 ) -> Dict[str, float]:
     mat = loadmat(record.path)
-    signal = _extract_signal(mat, record.sensor)
+    signal, channel_key = _extract_signal(mat, record=record)
     rpm = _extract_rpm(mat)
 
     prepared_signal, effective_rate = _prepare_signal(
@@ -393,16 +449,26 @@ def extract_features_for_record(
         clip_seconds=clip_seconds,
     )
 
-    features = {
+    duration = prepared_signal.size / effective_rate if effective_rate > 0 else float("nan")
+    sensor_label = record.sensor if record.sensor is not None else "Unknown"
+
+    features: Dict[str, float] = {
+        "domain": record.domain,
+        "dataset": record.dataset,
         "file_path": str(record.path),
-        "sensor": record.sensor,
+        "file_name": record.path.name,
+        "sensor": sensor_label,
+        "channel_key": channel_key,
         "fault_type": record.fault_type,
         "fault_size": record.fault_size if record.fault_size is not None else np.nan,
         "load": record.load if record.load is not None else np.nan,
         "orientation": record.orientation if record.orientation is not None else "",
         "rpm": rpm if rpm is not None else np.nan,
         "sample_rate": effective_rate,
+        "original_sample_rate": record.sample_rate,
+        "resample_factor": effective_rate / record.sample_rate if record.sample_rate > 0 else np.nan,
         "signal_length": prepared_signal.size,
+        "duration_seconds": duration,
     }
 
     features.update(_time_features(prepared_signal))
@@ -413,33 +479,93 @@ def extract_features_for_record(
     return features
 
 
-def _summarise_dataset(records: List[BearingRecord], features_df: pd.DataFrame) -> Dict[str, object]:
-    summary = {
-        "num_records": len(records),
-        "fault_type_counts": features_df["fault_type"].value_counts().to_dict(),
-        "loads": sorted(features_df["load"].dropna().unique().tolist()),
-        "sample_rate_distribution": features_df["sample_rate"].value_counts().to_dict(),
+def _summarise_dataset(records: Sequence[BearingRecord], features_df: pd.DataFrame) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "num_records": int(len(records)),
+        "domains": {k: int(v) for k, v in features_df["domain"].value_counts().items()},
+        "datasets": {k: int(v) for k, v in features_df["dataset"].value_counts().items()},
+        "sensors": {k: int(v) for k, v in features_df["sensor"].value_counts().items()},
+        "fault_type_counts": {k: int(v) for k, v in features_df["fault_type"].value_counts().items()},
     }
-    if "fault_size" in features_df.columns:
-        summary["fault_sizes"] = sorted(features_df["fault_size"].dropna().unique().tolist())
+
+    domain_fault_counts: Dict[str, Dict[str, int]] = {}
+    for domain, group in features_df.groupby("domain"):
+        domain_fault_counts[domain] = {k: int(v) for k, v in group["fault_type"].value_counts().items()}
+    summary["fault_type_counts_by_domain"] = domain_fault_counts
+
+    loads = features_df["load"].dropna()
+    if not loads.empty:
+        summary["loads"] = sorted(int(x) for x in loads.unique())
+
+    fault_sizes = features_df["fault_size"].dropna()
+    if not fault_sizes.empty:
+        summary["fault_sizes"] = sorted(float(x) for x in fault_sizes.unique())
+
+    summary["original_sample_rate_distribution"] = {
+        float(rate): int(count)
+        for rate, count in features_df["original_sample_rate"].value_counts().items()
+    }
+    summary["effective_sample_rate_distribution"] = {
+        float(rate): int(count)
+        for rate, count in features_df["sample_rate"].value_counts().items()
+    }
+
+    durations = features_df["duration_seconds"].dropna()
+    if not durations.empty:
+        summary["duration_seconds"] = {
+            "min": float(durations.min()),
+            "max": float(durations.max()),
+            "mean": float(durations.mean()),
+        }
+
+    summary["example_records"] = {
+        domain: group["file_name"].drop_duplicates().sort_values().head(5).tolist()
+        for domain, group in features_df.groupby("domain")
+    }
+
     return summary
 
 
 def run_pipeline(
-    source_root: Path,
-    output_dir: Path,
     *,
-    sensor: str,
-    orientation: str,
+    source_root: Path,
+    target_root: Optional[Path],
+    output_dir: Path,
+    include_source: bool,
+    include_target: bool,
+    include_sensors: Optional[Sequence[str]],
+    include_datasets: Optional[Sequence[str]],
     target_sample_rate: Optional[float],
     clip_seconds: Optional[float],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if sensor.upper() != "DE":
-        raise NotImplementedError("Currently only drive-end sensor data is curated")
+    records: List[BearingRecord] = []
 
-    records = collect_drive_end_records(source_root, orientation=orientation)
+    sensor_filter = {s.upper() for s in include_sensors} if include_sensors else None
+
+    if include_source:
+        records.extend(
+            collect_source_records(
+                source_root,
+                include_datasets=include_datasets,
+                include_sensors=include_sensors,
+            )
+        )
+
+    if include_target and target_root is not None:
+        records.extend(collect_target_records(target_root))
+
+    if sensor_filter:
+        filtered_records = []
+        for record in records:
+            label = record.sensor.upper() if record.sensor else "UNKNOWN"
+            if label in sensor_filter:
+                filtered_records.append(record)
+        records = filtered_records
+
+    if not records:
+        raise RuntimeError("No records were collected. Check dataset paths and filters.")
 
     feature_rows = []
     for record in records:
@@ -451,12 +577,19 @@ def run_pipeline(
         feature_rows.append(feature_row)
 
     features_df = pd.DataFrame(feature_rows)
+    features_df.sort_values(["domain", "dataset", "file_name"], inplace=True)
+
+    catalog_path = output_dir / "record_catalog.csv"
+    catalog_df = pd.DataFrame([record.to_dict() for record in records])
+    catalog_df.sort_values(["domain", "dataset", "path"], inplace=True)
+    catalog_df.to_csv(catalog_path, index=False)
+
     features_path = output_dir / "features.csv"
     features_df.to_csv(features_path, index=False)
 
-    # Class-wise mean feature values to support quick analysis.
     numeric_cols = features_df.select_dtypes(include=[np.number]).columns
-    mean_df = features_df.groupby("fault_type")[numeric_cols].mean().reset_index()
+    group_cols = ["domain", "dataset", "sensor", "fault_type"]
+    mean_df = features_df.groupby(group_cols)[numeric_cols].mean().reset_index()
     mean_path = output_dir / "feature_means.csv"
     mean_df.to_csv(mean_path, index=False)
 
@@ -464,7 +597,8 @@ def run_pipeline(
     summary_path = output_dir / "dataset_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
 
-    print(f"Wrote {len(features_df)} feature rows to {features_path}")
+    print(f"Processed {len(records)} records. Metadata saved to {catalog_path}")
+    print(f"Wrote per-record features to {features_path}")
     print(f"Class-wise statistics saved to {mean_path}")
     print(f"Dataset summary saved to {summary_path}")
 
@@ -472,33 +606,51 @@ def run_pipeline(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bearing feature extraction pipeline")
     parser.add_argument("--source-root", type=Path, default=Path("数据集/源域数据集"))
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/source_features"))
-    parser.add_argument("--sensor", type=str, default="DE", help="Sensor channel to use (currently only DE supported)")
+    parser.add_argument("--target-root", type=Path, default=Path("数据集/目标域数据集"))
+    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/full_features"))
+    parser.add_argument("--skip-source", action="store_true", help="Do not process source-domain records")
+    parser.add_argument("--skip-target", action="store_true", help="Do not process target-domain records")
     parser.add_argument(
-        "--orientation",
-        type=str,
-        default="Centered",
-        help="Outer-race fault orientation to include (Centered/Opposite/Orthogonal)",
+        "--sensors",
+        nargs="*",
+        default=None,
+        help="Optional list of sensors to include (e.g. DE FE BA Unknown). Defaults to all",
     )
-    parser.add_argument("--target-sample-rate", type=float, default=12000.0, help="Resample signals to this rate")
+    parser.add_argument(
+        "--source-datasets",
+        nargs="*",
+        default=None,
+        help="Optional list of source dataset directory names to include",
+    )
+    parser.add_argument(
+        "--target-sample-rate",
+        type=float,
+        default=12000.0,
+        help="Resample every signal to this rate (<=0 keeps the original rate)",
+    )
     parser.add_argument(
         "--clip-seconds",
         type=float,
         default=8.0,
-        help="Clip or pad each signal to this duration in seconds (use 0 to disable)",
+        help="Clip or pad signals to this duration in seconds (<=0 disables clipping)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    clip_seconds = None if args.clip_seconds is None or args.clip_seconds <= 0 else args.clip_seconds
+    target_rate = args.target_sample_rate if args.target_sample_rate and args.target_sample_rate > 0 else None
+    clip_seconds = args.clip_seconds if args.clip_seconds and args.clip_seconds > 0 else None
+
     run_pipeline(
         source_root=args.source_root,
+        target_root=args.target_root,
         output_dir=args.output_dir,
-        sensor=args.sensor,
-        orientation=args.orientation,
-        target_sample_rate=args.target_sample_rate,
+        include_source=not args.skip_source,
+        include_target=not args.skip_target,
+        include_sensors=args.sensors,
+        include_datasets=args.source_datasets,
+        target_sample_rate=target_rate,
         clip_seconds=clip_seconds,
     )
 
