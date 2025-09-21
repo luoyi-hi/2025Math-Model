@@ -1,0 +1,78 @@
+{
+  "num_records": 177,
+  "domains": {
+    "source": 161,
+    "target": 16
+  },
+  "datasets": {
+    "12kHz_DE_data": 60,
+    "48kHz_DE_data": 52,
+    "12kHz_FE_data": 45,
+    "目标域数据集": 16,
+    "48kHz_Normal_data": 4
+  },
+  "sensors": {
+    "DE": 116,
+    "FE": 45,
+    "Unknown": 16
+  },
+  "fault_type_counts": {
+    "OR": 77,
+    "B": 40,
+    "IR": 40,
+    "Unknown": 16,
+    "N": 4
+  },
+  "fault_type_counts_by_domain": {
+    "source": {
+      "OR": 77,
+      "B": 40,
+      "IR": 40,
+      "N": 4
+    },
+    "target": {
+      "Unknown": 16
+    }
+  },
+  "loads": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "fault_sizes": [
+    0.007,
+    0.014,
+    0.021,
+    0.028
+  ],
+  "original_sample_rate_distribution": {
+    "12000.0": 105,
+    "48000.0": 56,
+    "32000.0": 16
+  },
+  "effective_sample_rate_distribution": {
+    "12000.0": 177
+  },
+  "duration_seconds": {
+    "min": 8.0,
+    "max": 8.0,
+    "mean": 8.0
+  },
+  "example_records": {
+    "source": [
+      "B007_0.mat",
+      "B007_1.mat",
+      "B007_2.mat",
+      "B007_3.mat",
+      "B014_0.mat"
+    ],
+    "target": [
+      "A.mat",
+      "B.mat",
+      "C.mat",
+      "D.mat",
+      "E.mat"
+    ]
+  }
+}
